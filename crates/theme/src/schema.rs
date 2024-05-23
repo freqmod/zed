@@ -13,6 +13,21 @@ pub enum AppearanceContent {
     Dark,
 }
 
+/* TODO: where did theme_colors_refinement go?
+        editor_jump_marker: this
+            .editor_jump_marker
+            .as_ref()
+            .and_then(|color| try_parse_color(color).ok()),
+        editor_jump_marker_entered: this
+            .editor_jump_marker_entered
+            .as_ref()
+            .and_then(|color| try_parse_color(color).ok()),
+        editor_jump_marker_first: this
+            .editor_jump_marker_first
+            .as_ref()
+            .and_then(|color| try_parse_color(color).ok()),
+*/
+
 /// Parses a color string into an [`Hsla`] value.
 pub fn try_parse_color(color: &str) -> anyhow::Result<Hsla> {
     let rgba = gpui::Rgba::try_from(color)?;

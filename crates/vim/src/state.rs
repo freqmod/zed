@@ -19,11 +19,12 @@ use gpui::{
 };
 use language::{Buffer, BufferEvent, BufferId, Chunk, LanguageAwareStyling, Point};
 
-use multi_buffer::MultiBufferRow;
+use multi_buffer::{JumpMarkerLabel, MultiBufferRow};
 use picker::{Picker, PickerDelegate};
 use project::{Project, ProjectItem, ProjectPath};
 use serde::{Deserialize, Serialize};
 use settings::{Settings, SettingsStore};
+use smallvec::SmallVec;
 use std::borrow::BorrowMut;
 use std::collections::HashSet;
 use std::path::Path;
@@ -159,6 +160,9 @@ pub enum Operator {
         behaviour: HelixJumpBehaviour,
         first_char: Option<char>,
         labels: Vec<HelixJumpLabel>,
+    },
+    GoToLineLocation {
+        entered_characters: SmallVec<[char; JumpMarkerLabel::MAX_LABEL_KEYSTROKES]>,
     },
 }
 
@@ -1106,6 +1110,7 @@ impl Operator {
             Operator::HelixSurroundAdd => "helix_ms",
             Operator::HelixSurroundReplace { .. } => "helix_mr",
             Operator::HelixSurroundDelete => "helix_md",
+            Operator::GoToLineLocation { .. } => "helix_gw",
         }
     }
 
@@ -1162,7 +1167,8 @@ impl Operator {
                 target: Some(_), ..
             }
             | Operator::DeleteSurrounds
-            | Operator::HelixJump { .. } => true,
+            | Operator::HelixJump { .. }
+            | Operator::GoToLineLocation { .. } => true,
             Operator::Change
             | Operator::Delete
             | Operator::Yank
@@ -1222,6 +1228,7 @@ impl Operator {
             | Operator::Object { .. }
             | Operator::FindForward { .. }
             | Operator::FindBackward { .. }
+            | Operator::GoToLineLocation { .. }
             | Operator::Sneak { .. }
             | Operator::SneakBackward { .. }
             | Operator::Mark

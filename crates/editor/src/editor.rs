@@ -156,7 +156,7 @@ use mouse_context_menu::MouseContextMenu;
 use movement::TextLayoutDetails;
 use multi_buffer::{
     ExcerptBoundaryInfo, ExpandExcerptDirection, MultiBufferDiffHunk, MultiBufferPoint,
-    MultiBufferRow,
+    MultiBufferRow, JumpMarkerLabel, JumpMarkerMap
 };
 use parking_lot::Mutex;
 use persistence::EditorDb;
@@ -245,6 +245,7 @@ use crate::{
     semantic_tokens::SemanticTokenState,
     signature_help::{SignatureHelpHiddenBy, SignatureHelpState},
 };
+//             visible_line_jump_overlay: true,
 
 pub const FILE_HEADER_HEIGHT: u32 = 2;
 pub const BUFFER_HEADER_PADDING: Rems = rems(0.25);
@@ -1388,6 +1389,8 @@ pub struct Editor {
     sticky_headers_task: Task<()>,
     sticky_headers: Option<Vec<OutlineItem<Anchor>>>,
     pub(crate) colorize_brackets_task: Task<()>,
+    visible_line_jump_overlay: Option<SmallVec<[char; JumpMarkerLabel::MAX_LABEL_KEYSTROKES]>>,
+    pub(crate) jump_marker_locations: Option<JumpMarkerMap>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -2684,6 +2687,8 @@ impl Editor {
             sticky_headers_task: Task::ready(()),
             sticky_headers: None,
             colorize_brackets_task: Task::ready(()),
+            visible_line_jump_overlay: None,
+            jump_marker_locations: None,
         };
 
         if is_minimap {
@@ -23746,6 +23751,48 @@ impl Editor {
     pub fn set_show_wrap_guides(&mut self, show_wrap_guides: bool, cx: &mut Context<Self>) {
         self.show_wrap_guides = Some(show_wrap_guides);
         cx.notify();
+    }
+
+    pub fn line_jump_overlay_is_visible(&self) -> bool {
+        self.visible_line_jump_overlay.is_some()
+    }
+
+    pub fn line_jump_overlay_entered_characters(
+        &self,
+    ) -> Option<&SmallVec<[char; JumpMarkerLabel::MAX_LABEL_KEYSTROKES]>> {
+        self.visible_line_jump_overlay.as_ref()
+    }
+
+    pub fn jump_marker_locations(&self) -> &Option<JumpMarkerMap> {
+        &self.jump_marker_locations
+    }
+
+    pub fn go_to_line_location_impl(
+        &mut self,
+        _win: &mut Window,
+        _cx: &mut Context<Self>,
+        characters: Option<SmallVec<[char; JumpMarkerLabel::MAX_LABEL_KEYSTROKES]>>,
+    ) {
+        // First figure out how to overlay the jump targets for the characters
+        // then figure out how to accept one or two keys input before going back to normal mode
+        if !(characters.is_none() && self.visible_line_jump_overlay.is_some()) {
+            self.visible_line_jump_overlay = Some(characters.unwrap_or_default());
+        }
+    }
+
+    pub fn go_to_line_location_stop(&mut self) {
+        self.visible_line_jump_overlay = None;
+        self.jump_marker_locations = None;
+    }
+
+    pub fn go_to_line_location(
+        &mut self,
+        win: &mut Window,
+        cx: &mut Context<Self>,
+        characters: Option<SmallVec<[char; JumpMarkerLabel::MAX_LABEL_KEYSTROKES]>>,
+    ) {
+        // figure out how to use input ignored... (vim. input ignored)
+        self.go_to_line_location_impl(win, cx, characters)
     }
 
     pub fn set_show_indent_guides(&mut self, show_indent_guides: bool, cx: &mut Context<Self>) {

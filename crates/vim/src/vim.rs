@@ -9,6 +9,7 @@ mod digraph;
 mod helix;
 mod indent;
 mod insert;
+mod jump_markers;
 mod mode_indicator;
 mod motion;
 mod normal;
@@ -21,6 +22,8 @@ mod visual;
 
 use crate::normal::paste::Paste as VimPaste;
 use collections::HashMap;
+use smallvec::SmallVec;
+
 use editor::{
     Anchor, Bias, Editor, EditorEvent, EditorSettings, HideMouseCursorOrigin, MultiBufferOffset,
     NavigationOverlayKey, NavigationTargetOverlay, SelectionEffects,
@@ -36,7 +39,7 @@ use insert::{NormalBefore, TemporaryNormal};
 use language::{CursorShape, Point, Selection, SelectionGoal, TransactionId};
 pub use mode_indicator::ModeIndicator;
 use motion::Motion;
-use multi_buffer::ToPoint as _;
+use multi_buffer::{JumpMarkerLabel, JumpMarkerLocation, ToPoint as _};
 use normal::search::SearchSubmit;
 use object::Object;
 use schemars::JsonSchema;
@@ -53,6 +56,7 @@ use std::{mem, ops::Range, sync::Arc};
 use surrounds::SurroundsType;
 use theme_settings::ThemeSettings;
 use ui::{IntoElement, SharedString, px};
+use util::ResultExt;
 use vim_mode_setting::HelixModeSetting;
 use vim_mode_setting::VimModeSetting;
 use workspace::{self, Pane, Workspace};
@@ -163,6 +167,14 @@ struct PushLiteral {
     prefix: Option<String>,
 }
 
+#[derive(Clone, Deserialize, JsonSchema, PartialEq, Action)]
+#[action(namespace = vim)]
+#[serde(deny_unknown_fields)]
+struct PushHelixGoToLineLocation {
+    // todo, see if we can use keystroke instead, but needs json schema implementation
+    entered_characters: Vec<char>,
+}
+
 actions!(
     vim,
     [
@@ -270,6 +282,8 @@ actions!(
         PushHelixSurroundDelete,
     ]
 );
+///// Go to the beginning of a word (based on a map of words on the screen)
+//PushHelixGoToLineLocation,
 
 // in the workspace namespace so it's not filtered out when vim is disabled.
 actions!(
@@ -968,6 +982,24 @@ impl Vim {
             Vim::action(
                 editor,
                 cx,
+                |vim, action: &PushHelixGoToLineLocation, window, cx| {
+                    vim.prepare_go_to_line_location(window, cx);
+
+                    vim.push_operator(
+                        Operator::GoToLineLocation {
+                            entered_characters: SmallVec::from_iter(
+                                action.entered_characters.iter().map(|c| *c),
+                            ),
+                        },
+                        window,
+                        cx,
+                    )
+                },
+            );
+
+            Vim::action(
+                editor,
+                cx,
                 |vim, _: &editor::actions::Paste, window, cx| match vim.mode {
                     Mode::Replace => vim.paste_replace(window, cx),
                     Mode::Visual | Mode::VisualLine | Mode::VisualBlock => {
@@ -1369,6 +1401,7 @@ impl Vim {
                         // Navigation operators -> Block cursor
                         Operator::FindForward { .. }
                         | Operator::FindBackward { .. }
+                        | Operator::GoToLineLocation { .. }
                         | Operator::Mark
                         | Operator::Jump { .. }
                         | Operator::Register
@@ -2177,6 +2210,92 @@ impl Vim {
                 }
             },
             Some(Operator::Jump { line }) => self.jump(text, line, true, window, cx),
+            Some(Operator::GoToLineLocation {
+                mut entered_characters,
+            }) => {
+                // How to set up painting before getting the character?
+                log::warn!(
+                    "Vim go to line location operator: {:?}, txt: {}",
+                    entered_characters,
+                    text
+                );
+
+                let mut jump_to = None;
+                if let Some(jump_marker_locations) = self
+                    .editor()
+                    .and_then(|editor| editor.read(cx).jump_marker_locations().as_ref())
+                {
+                    if let Some(next_char) = text.chars().next() {
+                        entered_characters.push(next_char);
+                    }
+
+                    let current_location = JumpMarkerLocation {
+                        anchor: Anchor::Min,
+                        label: JumpMarkerLabel(entered_characters.clone()),
+                        window_location: Default::default(), // TODO: Maybe store absolute location here?
+                    };
+                    let locations = &jump_marker_locations.locations;
+                    let mut leave_jump_location_mode = false;
+                    let mut start_with_match_found = false;
+                    /*log::warn!(
+                        "Current location: {:?}",
+                        current_location.label.as_render_text()
+                    );*/
+                    for location in locations.iter_from(&current_location) {
+                        if location.label == current_location.label {
+                            //log::warn!("Full match: {:?}", location.label.as_render_text());
+                            // A matching location was found, jump to this
+                            jump_to = Some(Motion::Jump {
+                                anchor: location.anchor.clone(),
+                                line: false,
+                            });
+                            leave_jump_location_mode = true;
+                            break;
+                        } else if !location.starts_with(&current_location) {
+                            //log::warn!("Not start with: {:?} ", location.label.as_render_text());
+
+                            // Leave go to location mode, if no earlier matches have been found
+                            leave_jump_location_mode = !start_with_match_found;
+                            break;
+                        } else {
+                            start_with_match_found = true;
+                            //log::warn!("Start with: {:?} ", location.label.as_render_text());
+                        }
+                        // A matching start was found, continue in go to location mode, with the new character,
+                        // see if other locations match
+                    }
+                    if leave_jump_location_mode {
+                        //log::warn!("Leave jump location mode",);
+                        self.editor
+                            .update(cx, |editor, _cx| editor.go_to_line_location_stop())
+                            .log_err();
+                    } else {
+                        self.editor
+                            .update(cx, |editor, cx| {
+                                editor.go_to_line_location(
+                                    window,
+                                    cx,
+                                    Some(entered_characters.clone()),
+                                )
+                            })
+                            .log_err();
+                        // Push go to line location with new characters entered
+                        self.push_operator(
+                            Operator::GoToLineLocation { entered_characters },
+                            window,
+                            cx,
+                        );
+                    }
+                };
+                if let Some(jump_to) = jump_to {
+                    log::warn!("Vim queue new jump: {:?}", jump_to);
+
+                    self.motion(jump_to, window, cx)
+                }
+                // TODO: Figure out if we can modify the operator in the case where we want to record multiple keystrokes
+                // Todo: Figure out how to get access to the jump_marker_locations in the EditorLayout
+            }
+
             _ => {
                 if self.mode == Mode::Replace {
                     self.multi_replace(text, window, cx)
@@ -2195,9 +2314,24 @@ impl Vim {
         }
     }
 
+    fn prepare_go_to_line_location(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editor
+            .update(cx, |editor, cx| {
+                editor.go_to_line_location(window, cx, None)
+            })
+            .log_err();
+    }
+
     fn sync_vim_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let state = self.state_for_editor_settings(cx);
-        self.update_editor(cx, |_, editor, cx| {
+        self.update_editor(cx, |s, editor, cx| {
+            match s.active_operator() {
+                Some(Operator::GoToLineLocation { .. }) => {
+                    editor.go_to_line_location(window, cx, None)
+                }
+                _ => editor.go_to_line_location_stop(),
+            }
+
             Vim::sync_vim_settings_to_editor(&state, editor, window, cx);
         });
         cx.notify()

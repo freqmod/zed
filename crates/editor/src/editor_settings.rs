@@ -1,7 +1,9 @@
 use core::num;
 
 use gpui::App;
+
 use language::CursorShape;
+use multi_buffer::{JumpLabelSettingsRef, JumpMarkerLabel};
 use project::project_settings::DiagnosticSeverity;
 pub use settings::{
     CodeLens, CompletionDetailAlignment, CurrentLineHighlight, DelayMs, DiffViewStyle, DisplayIn,
@@ -10,7 +12,7 @@ pub use settings::{
     MultiCursorModifier, ScrollBeyondLastLine, ScrollbarDiagnostics, SeedQuerySetting, ShowMinimap,
     SnippetSortOrder,
 };
-use settings::{RegisterSetting, RelativeLineNumbers, Settings};
+use settings::{JumpLabelSettingsContent, RegisterSetting, RelativeLineNumbers, Settings};
 use ui::scrollbars::ShowScrollbar;
 
 /// Imports from the VSCode settings at
@@ -67,7 +69,39 @@ pub struct EditorSettings {
     pub completion_detail_alignment: CompletionDetailAlignment,
     pub diff_view_style: DiffViewStyle,
     pub minimum_split_diff_width: f32,
+    pub jump_labels: JumpLabelSettings,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JumpLabelSettings {
+    pub screen_before: Vec<JumpMarkerLabel>,
+    pub screen_after: Vec<JumpMarkerLabel>,
+}
+
+impl Default for JumpLabelSettings {
+    fn default() -> Self {
+        Self::from(JumpLabelSettingsContent::default())
+    }
+}
+
+impl From<JumpLabelSettingsContent> for JumpLabelSettings {
+    fn from(content: JumpLabelSettingsContent) -> Self {
+        JumpLabelSettings {
+            screen_before: JumpMarkerLabel::convert_list(&content.screen_before),
+            screen_after: JumpMarkerLabel::convert_list(&content.screen_after),
+        }
+    }
+}
+
+impl<'l> Into<JumpLabelSettingsRef<'l>> for &'l JumpLabelSettings {
+    fn into(self) -> JumpLabelSettingsRef<'l> {
+        JumpLabelSettingsRef {
+            screen_before: &self.screen_before,
+            screen_after: &self.screen_after,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Jupyter {
     /// Whether the Jupyter feature is enabled.
@@ -309,6 +343,10 @@ impl Settings for EditorSettings {
             completion_detail_alignment: editor.completion_detail_alignment.unwrap(),
             diff_view_style: editor.diff_view_style.unwrap(),
             minimum_split_diff_width: editor.minimum_split_diff_width.unwrap(),
+            jump_labels: editor
+                .jump_labels
+                .map(Into::into)
+                .unwrap_or(JumpLabelSettings::default()),
         }
     }
 }

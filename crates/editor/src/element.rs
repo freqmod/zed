@@ -58,7 +58,7 @@ use language::{
 use markdown::Markdown;
 use multi_buffer::{
     Anchor, ExcerptBoundaryInfo, ExpandExcerptDirection, ExpandInfo, MultiBufferPoint,
-    MultiBufferRow, RowInfo,
+    MultiBufferRow, RowInfo, JumpMarkerLabel, JumpMarkerMap
 };
 
 use project::{
@@ -183,6 +183,11 @@ impl SelectionLayout {
             user_name,
         }
     }
+}
+
+#[derive(Debug, Default, Clone)]
+struct JumpMarkersShaped {
+    shaped_markers: HashMap<JumpMarkerLabel, ShapedLine>,
 }
 
 #[derive(Default)]
@@ -6655,6 +6660,7 @@ impl EditorElement {
                 self.paint_inline_blame(layout, window, cx);
                 self.paint_inline_code_actions(layout, window, cx);
                 self.paint_diff_hunk_controls(layout, window, cx);
+                self.paint_jump_markers(layout, window, cx);
                 window.with_element_namespace("crease_trailers", |window| {
                     for trailer in layout.crease_trailers.iter_mut().flatten() {
                         trailer.element.paint(window, cx);
@@ -6944,6 +6950,225 @@ impl EditorElement {
         for cursor in &mut layout.visible_cursors {
             cursor.paint(layout.content_origin, window, cx);
         }
+    }
+
+    fn paint_jump_markers(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
+        struct JumpMarkerPaintInfo {
+            label: JumpMarkerLabel,
+            origin: gpui::Point<Pixels>,
+            line_height: Pixels,
+            matching_prefix_len: Option<usize>,
+        }
+        let mut marker_paint_info: Vec<JumpMarkerPaintInfo> = Default::default();
+        self.editor.update(cx, |editor, cx| {
+            let editor_snapshot = editor.snapshot(window, cx); // todo, maybe do row lookup when making the map
+            let jump_marker_locations = editor.jump_marker_locations.as_ref();
+            let entered_string = editor.line_jump_overlay_entered_characters();
+            if jump_marker_locations.is_some_and(|l| !l.locations.is_empty()) {
+                log::error!(
+                    "Paint markers: {:?} Shaped: {} Scp: {:?}, Es: {:?}",
+                    jump_marker_locations
+                        .as_ref()
+                        .map(|l| l.locations.iter().count()),
+                    layout
+                        .jump_markers_shaped
+                        .as_ref()
+                        .map(|s| s.shaped_markers.len())
+                        .unwrap_or_default(),
+                    layout.position_map.snapshot.scroll_position(),
+                    entered_string
+                );
+            }
+            if layout
+                .jump_markers_shaped
+                .as_ref()
+                .is_none_or(|m| m.shaped_markers.is_empty())
+                || jump_marker_locations
+                    .as_ref()
+                    .is_none_or(|l| l.locations.is_empty())
+            {
+                return;
+            }
+            let Some(jump_marker_locations) = jump_marker_locations.as_ref() else {
+                return;
+            };
+            //editor_snapshot.row_infos(visible_row_range.start,)
+
+            let content_origin = layout.content_origin;
+            let line_height = layout.position_map.line_height;
+            let first_visible_row = layout.position_map.visible_row_range.start;
+            let scroll_position = layout.position_map.snapshot.scroll_position();
+            let scroll_pixel_position = layout.position_map.scroll_pixel_position;
+            let wrap_snapshot = editor_snapshot.wrap_snapshot();
+            //let row_infos = editor_snapshot
+            //    .row_infos(first_visible_row)
+            //    .take(layout.position_map.visible_row_range.len());
+            marker_paint_info.reserve(jump_marker_locations.locations.iter().count());
+            for location in jump_marker_locations.locations.iter() {
+                let marker = location;
+                let wrapped_point =
+                    wrap_snapshot.make_wrap_point(location.window_location, Bias::Left);
+
+                if wrapped_point.0.row < first_visible_row.0 {
+                    // TODO: Check for marker below the screen
+                    // Maker is above the screen, skip shaping it
+                    continue;
+                }
+
+                let window_line_index = (wrapped_point.0.row - first_visible_row.0) as usize;
+
+                // can we get shape information from when the text is laid out and annotate it in the jump marker locations
+                let Some(line_layout) = &layout.position_map.line_layouts.get(window_line_index)
+                else {
+                    continue;
+                };
+
+                let left_edge_column = line_layout.index_for_x(scroll_position.x.into());
+
+                if left_edge_column.is_none_or(|col| (wrapped_point.0.column as usize) < col) {
+                    // Maker is to the left of the screen, skip painting it
+                    // TODO: Check for marker to the right of the screen
+                    continue;
+                }
+
+                let window_column_index = wrapped_point.0.column as usize; // - left_edge_column.unwrap();
+
+                //|| location.node_range.start_point.column < left_edge_column
+                let line_y = (wrapped_point.0.row as f64
+                    - layout.position_map.scroll_position.y as f64)
+                    * ScrollPixelOffset::from(line_height);
+
+                let origin = content_origin
+                    + gpui::point(
+                        line_layout.x_for_index(window_column_index)
+                            - scroll_pixel_position.x.into(),
+                        line_y.into(),
+                    );
+
+                let matching_prefix_len = if let Some(entered_characters) = entered_string.as_ref()
+                {
+                    let marker_characters = &marker.label.0;
+                    if !entered_characters.is_empty()
+                        && marker_characters.len() > entered_characters.len()
+                    {
+                        if &marker_characters[0..entered_characters.len()]
+                            == entered_characters.as_slice()
+                        {
+                            Some(entered_characters.len())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                marker_paint_info.push(JumpMarkerPaintInfo {
+                    label: marker.label.clone(),
+                    origin,
+                    line_height,
+                    matching_prefix_len,
+                });
+            }
+        });
+        window.paint_layer(window.bounds(), |window| {
+            for marker_info in marker_paint_info {
+                if let Some(shaped) = layout
+                    .jump_markers_shaped
+                    .as_ref()
+                    .and_then(|shaped| shaped.shaped_markers.get(&marker_info.label))
+                {
+                    /*log::error!(
+                        "Paint marker at: Origin: {:?} Location: {:?}: {:?}",
+                        origin,
+                        marker.window_location,
+                        marker.label,
+                    );*/
+                    // TODO: Fix paint arguments
+                    /*
+                    &self,
+                    origin: Point<Pixels>,
+                    line_height: Pixels,
+                    align: TextAlign,
+                    align_width: Option<Pixels>,
+                    window: &mut Window,
+                    cx: &mut App,
+                            */
+                    shaped
+                        .paint_background(
+                            marker_info.origin,
+                            marker_info.line_height,
+                            TextAlign::Left,
+                            None,
+                            window,
+                            cx,
+                        )
+                        .log_err();
+                    if let Some(matching_prefix_len) = marker_info.matching_prefix_len.as_ref() {
+                        let rem_size = window.rem_size();
+                        let font_size = self.style.text.font_size.to_pixels(rem_size);
+                        let description = marker_info.label.as_render_text();
+
+                        let label_str: SharedString = description.into();
+                        let label_str_len = label_str.len();
+                        let newly_shaped = window.text_system().shape_line(
+                            label_str,
+                            font_size,
+                            &[
+                                TextRun {
+                                    len: *matching_prefix_len,
+                                    font: self.style.text.font(),
+                                    color: cx.theme().colors().editor_jump_marker_entered,
+                                    background_color: Some(
+                                        cx.theme().colors().editor_background.alpha(0.75),
+                                    ), //TODO: Make color themeable
+                                    underline: None,
+                                    strikethrough: None,
+                                },
+                                TextRun {
+                                    len: label_str_len - matching_prefix_len,
+                                    font: self.style.text.font(),
+                                    color: cx.theme().colors().editor_jump_marker,
+                                    background_color: Some(
+                                        cx.theme().colors().editor_background.alpha(0.75),
+                                    ), //TODO: Make color themeable
+                                    underline: None,
+                                    strikethrough: None,
+                                },
+                            ],
+                            None,
+                        );
+                        newly_shaped
+                            .paint(
+                                marker_info.origin,
+                                marker_info.line_height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .log_err();
+                    } else {
+                        shaped
+                            .paint(
+                                marker_info.origin,
+                                marker_info.line_height,
+                                TextAlign::Left,
+                                None,
+                                window,
+                                cx,
+                            )
+                            .log_err();
+                    }
+                }
+            }
+        });
+        // We should store the jump marker locations so that the jump commands know where to jump to
+
+        // if there is an active selection on the current line, print line (local) jump markes,
+        // otherwise global jump markers sloud be printed, but they need to be llocated in
+        // a function that marks the complete view (should this be done in prepaint?)
     }
 
     fn paint_scrollbars(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
@@ -9730,7 +9955,179 @@ impl EditorElement {
             Some(self.editor.clone())
         }
     }
+    /// This makes shaped strings of jump markers regardless of their positions.
+    /// The markers should be reusable regardless of the location of the strings they point to.
+    //HashMap<[char; 2], ShapedLine>, Vec<Vec<JumpMarker>>
+    fn shape_jump_markers(
+        &self,
+        font_size: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+        //position_map: &PositionMap,
+    ) -> Option<JumpMarkersShaped> {
+        /* TODO: Is there a way to cache this, so that we don't have to shape
+        the same jump labels every time the markers are activated? */
+        let jump_label_settings = &EditorSettings::get_global(cx).jump_labels;
+        /*log::error!(
+            "Shape markers: LL: {}",
+            jump_label_settings.left_line_labels.len()
+        );*/
+
+        let mut shaped_markers: HashMap<JumpMarkerLabel, ShapedLine> = Default::default();
+
+        for label in jump_label_settings
+            .screen_before
+            .iter()
+            .chain(jump_label_settings.screen_after.iter())
+        {
+            if shaped_markers.contains_key(&label) {
+                log::warn!("Skipping shaping duplicated marker: {:?}", label);
+                continue;
+            }
+            //let keystrokes = &label.0;
+            let description = label.as_render_text();
+
+            let label_str: SharedString = description.into();
+            let label_str_len = label_str.len();
+            let runs = match label_str_len {
+                0 => &[TextRun::default(), TextRun::default()],
+                1 => &[
+                    TextRun {
+                        len: label_str_len,
+                        font: self.style.text.font(),
+                        color: cx.theme().colors().editor_jump_marker_first,
+                        background_color: Some(cx.theme().colors().editor_background.alpha(0.75)), //TODO: Make color themeable
+                        underline: None,
+                        strikethrough: None,
+                    },
+                    TextRun::default(),
+                ],
+                _ => &[
+                    TextRun {
+                        len: 1,
+                        font: self.style.text.font(),
+                        color: cx.theme().colors().editor_jump_marker_first,
+                        background_color: Some(cx.theme().colors().editor_background.alpha(0.75)), //TODO: Make color themeable
+                        underline: None,
+                        strikethrough: None,
+                    },
+                    TextRun {
+                        len: label_str_len - 1,
+                        font: self.style.text.font(),
+                        color: cx.theme().colors().editor_jump_marker,
+                        background_color: Some(cx.theme().colors().editor_background.alpha(0.75)), //TODO: Make color themeable
+                        underline: None,
+                        strikethrough: None,
+                    },
+                ],
+            };
+            let line_label = window
+                .text_system()
+                .shape_line(label_str, font_size, runs, None);
+            assert!(
+                shaped_markers.insert(label.clone(), line_label).is_none(),
+                "Jump label markers are expected to be unique: {}",
+                &label,
+            );
+        }
+        log::error!("Shaped: {}", shaped_markers.len());
+
+        Some(JumpMarkersShaped { shaped_markers })
+    }
+
+    pub(crate) fn lay_out_jump_markers(
+        &self,
+        _font_size: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+        _position_map: &PositionMap,
+        visible_row_range: Range<DisplayRow>,
+        cursors: &Vec<(DisplayPoint, Hsla)>,
+    ) -> Option<JumpMarkerMap> {
+        let (editor_snapshot, multi_buffer_snapshot, _is_read_only) =
+            self.editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let multi_buffer = editor.buffer().read(cx);
+                (snapshot, multi_buffer.snapshot(cx), editor.read_only(cx))
+            });
+
+        // can we get access to the syntax tree too?
+        //model_snapshot.buffer_rows()
+        // Lay out jump markers
+        let first_cursor = cursors[0].0;
+
+        let display_point_to_offset = |point, bias| {
+            multi_buffer_snapshot.point_to_offset(
+                editor_snapshot
+                    .display_point_to_anchor(point, bias)
+                    .to_point(&multi_buffer_snapshot),
+            )
+        };
+
+        let first_cursor_offset = display_point_to_offset(first_cursor, Bias::Left);
+        let visible_range_offset =
+            display_point_to_offset(DisplayPoint::new(visible_row_range.start, 0), Bias::Left)
+                ..display_point_to_offset(DisplayPoint::new(visible_row_range.end, 0), Bias::Right);
+
+        let jump_label_settings = (&EditorSettings::get_global(cx).jump_labels).into();
+        let buffer_map = multi_buffer_snapshot.create_jump_marker_map(
+            &[first_cursor_offset],
+            visible_range_offset,
+            jump_label_settings,
+        );
+        Some(buffer_map)
+    }
 }
+/*
+#[derive(PartialEq, Eq, Clone)]
+struct JumpMarker {
+    window_location_x: Pixels,
+    //window_location_y: Pixels,
+    window_line_index: usize,
+    extent: Point,
+    marker: [char; 2],
+    byte_range: Range<usize>,
+}
+
+impl JumpMarker {
+    fn for_tree_sitter_node(
+        visible_row_range: Range<DisplayRow>,
+        node: &language::Node<'_>,
+        marker: [char; 2],
+    ) -> Self {
+        let visible_start_row = visible_row_range.start;
+        let start_point = node.start_byte();
+        let end_point = node.end_byte();
+        // Need a way to convert byte offset to screen position
+        /*((start_point.row as u32).saturating_sub(visible_start_row.0),
+            start_point.column as u32,
+        );*/
+        let extent = Point::new(
+            (end_point - start_point - 1) as u32,
+            (node.range().end_point.column.saturating_sub(start_point)) as u32,
+        );
+        Self {
+            window_location_x: Pixels::default(),
+            //window_location_y: Pixels::default(),
+            window_line_index: 0,
+            extent,
+            marker,
+            byte_range: node.byte_range().clone(),
+        }
+    }
+}
+fn cursors_in_row(cursors: &Vec<(DisplayPoint, Hsla)>, row: &DisplayRow) -> Vec<DisplayPoint> {
+    cursors
+        .iter()
+        .filter_map(|(cursor, _hsla)| {
+            if cursor.row() == *row {
+                Some(cursor.clone())
+            } else {
+                None
+            }
+        })
+        .collect()
+}*/
 
 #[derive(Default)]
 pub struct EditorRequestLayoutState {
@@ -10830,6 +11227,9 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    // Draw line jump location overlays
+                    if self.editor.read(cx).line_jump_overlay_is_visible() {}
+
                     let line_elements = self.prepaint_lines(
                         start_row,
                         &mut line_layouts,
@@ -11163,6 +11563,7 @@ impl Element for EditorElement {
                         }],
                         None,
                     );
+                    // TODO: Do we need to shape one element for every type of jump marker (and store it in a hash map?)
 
                     let space_char = whitespace_map.space.clone();
                     let space_len = space_char.len();
@@ -11256,8 +11657,41 @@ impl Element for EditorElement {
                         diff_hunk_control_bounds,
                     });
 
+                    let (jump_markers_shaped, jump_marker_locations) =
+                        if self.editor.read(cx).line_jump_overlay_is_visible() {
+                            // TODO: Extend logic to support multiple selections
+                            let _local_selections: Vec<Selection<Point>> =
+                                self.editor.read(cx).selections.disjoint_in_range(
+                                    start_anchor..end_anchor,
+                                    &position_map.snapshot.display_snapshot,
+                                );
+                            let font_marker_font_size = font_size * 1.0;
+
+                            // TODO: This function is independent of the actual markers visible, see if the
+                            // shaping can be cached
+                            let layed_out = self.lay_out_jump_markers(
+                                font_marker_font_size,
+                                window,
+                                cx,
+                                &position_map,
+                                start_row..end_row,
+                                &cursors,
+                            );
+                            // Only shape jump markers if some are displayed
+                            let shaped_jump_markers =
+                                if layed_out.as_ref().is_some_and(|l| !l.locations.is_empty()) {
+                                    self.shape_jump_markers(font_marker_font_size, window, cx)
+                                } else {
+                                    Default::default()
+                                };
+                            (shaped_jump_markers, layed_out)
+                        } else {
+                            (None, None)
+                        };
+
                     self.editor.update(cx, |editor, _| {
-                        editor.last_position_map = Some(position_map.clone())
+                        editor.last_position_map = Some(position_map.clone());
+                        editor.jump_marker_locations = jump_marker_locations;
                     });
 
                     EditorLayout {
@@ -11306,6 +11740,7 @@ impl Element for EditorElement {
                         expand_toggles,
                         text_align: self.style.text.text_align,
                         content_width: text_hitbox.size.width,
+                        jump_markers_shaped,
                     }
                 })
             })
@@ -11525,6 +11960,7 @@ pub struct EditorLayout {
     document_colors: Option<(DocumentColorsRenderMode, Vec<(Range<DisplayPoint>, Hsla)>)>,
     text_align: TextAlign,
     content_width: Pixels,
+    jump_markers_shaped: Option<JumpMarkersShaped>,
 }
 
 struct StickyHeaders {

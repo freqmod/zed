@@ -231,6 +231,7 @@ pub struct DisplayMap {
     pub semantic_token_highlights: SemanticTokensHighlights,
     /// A container for explicitly foldable ranges, which supersede indentation based fold range suggestions.
     crease_map: CreaseMap,
+    /// Decides where the [`JumpMarker`]s should be displayed.
     pub(crate) fold_placeholder: FoldPlaceholder,
     pub clip_at_line_ends: bool,
     pub(crate) masked: bool,

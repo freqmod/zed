@@ -50,7 +50,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use sum_tree::{Bias, Cursor, Dimension, Dimensions, SumTree, TreeMap};
+use sum_tree::{Bias, Cursor, Dimension, Dimensions, SumTree, TreeMap, TreeSet};
 use text::{
     BufferId, Edit, LineIndent, TextSummary,
     subscription::{Subscription, Topic},
@@ -65,6 +65,120 @@ pub static EXCERPT_CONTEXT_LINES: OnceLock<fn(&App) -> u32> = OnceLock::new();
 
 pub fn excerpt_context_lines(cx: &App) -> u32 {
     EXCERPT_CONTEXT_LINES.get().map(|f| f(cx)).unwrap_or(2)
+}
+
+#[derive(Debug, Default, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ExcerptId(u32);
+
+#[derive(Debug, Default, Clone, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct JumpMarkerLabel(pub SmallVec<[char; JumpMarkerLabel::MAX_LABEL_KEYSTROKES]>);
+
+impl JumpMarkerLabel {
+    pub const MAX_LABEL_KEYSTROKES: usize = 4;
+
+    pub fn convert_list(list: &[String]) -> Vec<JumpMarkerLabel> {
+        list.iter()
+            .map(|e| JumpMarkerLabel::from(e.as_str()))
+            .collect()
+    }
+
+    pub fn as_render_text(&self) -> String {
+        let mut text = String::with_capacity(self.0.len());
+        for key in self.0.iter() {
+            text.push(*key);
+        }
+        text
+    }
+}
+
+impl From<&str> for JumpMarkerLabel {
+    fn from(value: &str) -> Self {
+        let mut chars =
+            SmallVec::with_capacity(value.len().min(JumpMarkerLabel::MAX_LABEL_KEYSTROKES));
+        chars.extend(value.chars().take(JumpMarkerLabel::MAX_LABEL_KEYSTROKES));
+        JumpMarkerLabel(chars)
+    }
+}
+impl From<&[char]> for JumpMarkerLabel {
+    fn from(value: &[char]) -> Self {
+        let mut chars =
+            SmallVec::with_capacity(value.len().min(JumpMarkerLabel::MAX_LABEL_KEYSTROKES));
+        chars.extend(
+            value
+                .iter()
+                .take(JumpMarkerLabel::MAX_LABEL_KEYSTROKES)
+                .map(|c| *c),
+        );
+        JumpMarkerLabel(chars)
+    }
+}
+
+impl fmt::Display for JumpMarkerLabel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for stroke in self.0.as_ref() {
+            write!(f, "{}", stroke)?;
+        }
+        Ok(())
+    }
+}
+
+/// TODO: Move this to a more appropriate location
+#[derive(PartialEq, Eq, Clone, Debug)]
+pub struct JumpMarkerLocation {
+    //pub node_range: Range<MultiBufferOffset>,
+    pub label: JumpMarkerLabel,
+    pub window_location: Point,
+    pub anchor: Anchor,
+}
+impl JumpMarkerLocation {
+    /*fn for_location(window_location: Point) -> Self {
+        Self {
+            //node_range,
+            window_location,
+            label: Default::default(),
+        }
+    }*/
+
+    pub fn starts_with(&self, starting_location: &JumpMarkerLocation) -> bool {
+        let self_label = &self.label.0;
+        let start_label = &starting_location.label.0;
+
+        self_label.len() >= start_label.len()
+            && self_label[0..start_label.len()].eq(start_label.as_slice())
+    }
+}
+
+impl Ord for JumpMarkerLocation {
+    fn cmp(&self, other: &Self) -> cmp::Ordering {
+        self.label
+            .cmp(&other.label)
+            .then(self.window_location.cmp(&other.window_location))
+    }
+}
+
+impl PartialOrd for JumpMarkerLocation {
+    fn partial_cmp(&self, other: &Self) -> Option<cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+#[derive(PartialEq, Eq, Clone, Default)]
+pub struct JumpMarkerMap {
+    pub locations: TreeSet<JumpMarkerLocation>,
+    pub backwards_len: usize,
+}
+
+impl JumpMarkerMap {
+    pub fn from_locations(locations: TreeSet<JumpMarkerLocation>, backwards_len: usize) -> Self {
+        JumpMarkerMap {
+            locations,
+            backwards_len,
+        }
+    }
+}
+
+pub struct JumpLabelSettingsRef<'a> {
+    pub screen_before: &'a [JumpMarkerLabel],
+    pub screen_after: &'a [JumpMarkerLabel],
 }
 
 /// One or more [`Buffers`](Buffer) being edited in a single view.
@@ -6739,6 +6853,419 @@ impl MultiBufferSnapshot {
         let start = Anchor::in_buffer(path_key, text::Anchor::min_for_buffer(buffer_id));
         let end = Anchor::in_buffer(path_key, text::Anchor::max_for_buffer(buffer_id));
         Some((start..end).to_point(self))
+    }
+    
+    pub fn create_jump_marker_map<'a>(
+        &self,
+        cursors: &[MultiBufferOffset],
+        visible_range: Range<MultiBufferOffset>,
+        label_settings: JumpLabelSettingsRef<'a>,
+    ) -> JumpMarkerMap {
+        const MIN_JUMP_MARKER_OFFSET_DISTANCE: isize = 4;
+        /*let first_excerpt_id = self.excerpts.first().map(|e| e.id);
+        log::error!(
+            "Create marker: C: {:?} R:{:?} Feid: {:?}",
+            cursors,
+            visible_range,
+            first_excerpt_id
+        );*/
+        // Range of visible area where jump markers should be made
+        // Get node for visible area, walk it and note down all the start / end points in an ordered map
+        // then create marker points related to the currunt cursor.
+        if cursors.is_empty() {
+            return JumpMarkerMap::default();
+        }
+
+        let visible_start = visible_range.start.to_offset(self);
+        let mut cursor = self.cursor::<MultiBufferOffset, BufferOffset>();
+        cursor.seek(&visible_start);
+
+        let Some(start_region) = cursor.region() else {
+            log::error!("Could not find region for start of viewport");
+            // if no syntax node, reset map, and possibly make a map based on
+            // word boundaries alone
+            return JumpMarkerMap::default();
+        };
+
+        let start_excerpt = &start_region.excerpt;
+
+        let visible_range_offset =
+            visible_range.start.to_offset(self)..visible_range.end.to_offset(self);
+        let buffer_start = visible_range_offset.start - start_region.range.start.0
+            + start_region.buffer_range.start.0;
+        let visible_range_len = visible_range_offset.end.0 - visible_range_offset.start.0;
+
+        let region_range = BufferOffset(buffer_start.0)
+            ..BufferOffset(
+                (buffer_start.0 + visible_range_len).min(start_region.buffer_range.end.0),
+            );
+
+        // TODO: Do  need to enumerate multi buffer excerpts instead?
+        // Multi buffers excerpts seems to be an external interface, maybe enumeate diffviews?
+        let mut excerpts_cursor = self.excerpts.cursor::<ExcerptSummary>(());
+        //let mut excerpts_cursor = self.excerpts.cursor::<Option<&Locator>>(());
+        excerpts_cursor.seek_forward(&start_excerpt.path_key, Bias::Left);
+        // TODO: We should probably handle all layers, and also cases where
+        // there is no syntax and we want to use starndard word boundary
+        // heuristics. but just use the first language for now to try to get
+        // someting running
+        let Some(syntax_layer) = start_excerpt.buffer_snapshot(self).syntax_layers().next() else {
+            log::error!("No syntax layer when laying out marker map");
+            // if no syntax node, reset map, and possibly make a map based on
+            // word boundaries alone
+            return JumpMarkerMap::default();
+        };
+        let cursor_node = syntax_layer.node();
+        /*log::warn!(
+            "Syntax layer count: {}",
+            start_excerpt.buffer.syntax_layers().count()
+        );*/
+
+        let mut tree_cursor = cursor_node.walk();
+        let mut offsets = Vec::new();
+
+        //let buffer_text = start_excerpt.buffer.text();
+        let buffer_snapshot = start_excerpt.buffer_snapshot(self);
+        // TODO: Try to avoid walking the whole file and rather walk the nodes that correspond to elements in view
+        // TODO: Anchor logic is off when soft wrap line breaks
+        'outer: loop {
+            let node = tree_cursor.node();
+
+            let node_range = node.range();
+            let buffer_node_range =
+                BufferOffset(node_range.start_byte)..BufferOffset(node_range.end_byte);
+
+            // This range is probably in buffer offsets
+
+            if region_range.contains(&BufferOffset(node_range.start_byte))
+                || region_range.contains(&BufferOffset(node_range.end_byte))
+            {
+                let node_range_length = node_range.end_byte.saturating_sub(node_range.start_byte);
+
+                if node.child_count() == 0
+                    && node_range_length > MIN_JUMP_MARKER_OFFSET_DISTANCE as usize
+                {
+                    // If node has a certain length, and no children go trough
+                    // the node as text and see if we should add markers inside
+                    // it (e.g. for word boundaries), where we transition from
+                    // alphanumeric charcters to special characters or vice versa
+                    let node_data = buffer_snapshot.text_for_range(buffer_node_range.clone());
+                    let mut lines = node_data.lines();
+                    let mut line_range_offset = 0;
+                    while let Some(line) = lines.next() {
+                        let first_alphanumeric = line
+                            .chars()
+                            .next()
+                            .map(|c| c.is_alphanumeric())
+                            .unwrap_or(false);
+                        offsets.extend(
+                            line.char_indices().enumerate()
+                                .scan(
+                                    (
+                                        first_alphanumeric, // was_alphanumeric
+                                        0usize,             // last_alphanumeric_offset
+                                    ),
+                                    |(was_alphanumeric, last_transition_offset),
+                                     (char_index, (byte_offset, c))| {
+                                        // How can we prioritize transitions from space to words
+                                        let is_alphanumeric = c.is_alphanumeric();
+                                        let last_was_alphanumeric = *was_alphanumeric;
+                                        *was_alphanumeric = is_alphanumeric;
+                                        if last_was_alphanumeric != is_alphanumeric {
+                                            if (last_was_alphanumeric && c.is_whitespace())
+                                                || ((char_index- *last_transition_offset)
+                                                    <= MIN_JUMP_MARKER_OFFSET_DISTANCE as usize)
+                                            {
+                                                Some(None)
+                                            } else {
+                                                *last_transition_offset = char_index;
+                                                Some(Some(byte_offset))
+                                            }
+                                        } else {
+                                            Some(None)
+                                        }
+                                    },
+                                )
+                                .filter_map(|line_offset| {
+                                    line_offset.map(|line_offset| {
+                                        let buffer_offset = buffer_node_range.start
+                                            + line_range_offset
+                                            + line_offset;
+                                        let start_point_buf =
+                                            buffer_snapshot.offset_to_point(buffer_offset.0);
+                                        let start_point = tree_sitter::Point {
+                                            row: start_point_buf.row as usize,
+                                            column: start_point_buf.column as usize,
+                                        };
+
+                                        (
+                                            start_point,
+                                            Anchor::in_buffer(
+                                                start_excerpt.path_key_index,
+                                                buffer_snapshot
+                                                    .anchor_at(buffer_offset, Bias::Left),
+                                            ),
+                                        )
+                                    })
+                                }),
+                        );
+                        line_range_offset += line.len();
+                    }
+                }
+                offsets.push((
+                    node_range.start_point,
+                    Anchor::in_buffer(
+                        start_excerpt.path_key_index,
+                        buffer_snapshot.anchor_at(node_range.start_byte, Bias::Left),
+                    ),
+                ));
+                offsets.push((
+                    node_range.end_point,
+                    Anchor::in_buffer(
+                        start_excerpt.path_key_index,
+                        buffer_snapshot.anchor_at(node_range.end_byte, Bias::Right),
+                    ),
+                ));
+                /*} else {
+                // If both start and end is outside the current screen break to
+                // avoid walking the whole file
+                break;*/
+            }
+
+            // Go down if possible
+            if tree_cursor.goto_first_child() {
+                continue;
+            }
+
+            // Otherwise try siblings, walking back up as needed
+            loop {
+                if tree_cursor.goto_next_sibling() {
+                    break;
+                }
+                if !tree_cursor.goto_parent() {
+                    // We're done, back at root and no more siblings
+                    break 'outer;
+                }
+                // Now on parent's node, get its next sibling
+                //tree_cursor.goto_next_sibling();
+            }
+        }
+
+        offsets.sort_unstable_by_key(|(point, _)| *point);
+
+        let mut jump_markers = TreeSet::<JumpMarkerLocation>::default();
+        // Create a map based on the offsets found until now
+        // Unless all cursors are on their own rows create a map based on the first cursor only
+        let num_backwards = if cursors.len() == 1
+            || !cursors
+                .iter()
+                .map(|c| self.offset_to_point(c.clone()).row)
+                .all_unique()
+        {
+            let cursor = &cursors[0];
+            let cursor_point = self.offset_to_point(cursor.clone());
+            let compare_offsets = |(o, _): &(tree_sitter::Point, Anchor)| match (o.row as u32)
+                .cmp(&cursor_point.row)
+            {
+                cmp::Ordering::Equal => (o.column as u32) < cursor_point.column,
+                cmp::Ordering::Less => true,
+                cmp::Ordering::Greater => false,
+            };
+
+            let num_backwards = offsets.partition_point(compare_offsets);
+
+            let mut new_offsets: Vec<(tree_sitter::Point, Anchor)> =
+                Vec::with_capacity(offsets.len());
+            let offset_filter = |last_kept: &'_ mut Option<(tree_sitter::Point, Anchor)>,
+                                 o: &(tree_sitter::Point, Anchor)| {
+                match last_kept {
+                    None => {
+                        *last_kept = Some(*o);
+                        Some(Some(*o))
+                    }
+                    Some(last)
+                        if (last.0.row != o.0.row
+                            || (last.0.column as isize - o.0.column as isize).abs()
+                                > MIN_JUMP_MARKER_OFFSET_DISTANCE) =>
+                    {
+                        *last_kept = Some(*o);
+                        Some(Some(*o))
+                    }
+                    _ => Some(None),
+                }
+            };
+
+            new_offsets.extend(
+                offsets[0..num_backwards]
+                    .iter()
+                    .rev()
+                    .scan(None, offset_filter)
+                    .filter_map(|o| o),
+            );
+            new_offsets.reverse();
+            if let Some(forward_filtered) =
+                offsets
+                    .get((num_backwards + 1)..offsets.len())
+                    .map(|forward_offsets| {
+                        forward_offsets
+                            .iter()
+                            .scan(None, offset_filter)
+                            .filter_map(|o| o)
+                    })
+            {
+                new_offsets.extend(forward_filtered);
+            }
+
+            let old_offsets = offsets;
+            offsets = new_offsets;
+
+            // Recalculate partition point with new offsets
+            let num_backwards = offsets.partition_point(compare_offsets);
+            // Partition point ends up one before the actual cursor (determined
+            // experimentally), compensate for this
+            let num_backwards = num_backwards.saturating_sub(1);
+            log::warn!(
+                "Split markers: At: {:?} {:?} - {:?} BW: {} Old total: {} Total: {} (First: {:?} Last: {:?})",
+                cursor_point,
+                offsets.get(num_backwards),
+                offsets.get(num_backwards + 1),
+                num_backwards,
+                old_offsets.len(),
+                offsets.len(),
+                offsets.get(0),
+                offsets.last(),
+            );
+            // Line backwards
+            {
+                let mut index = num_backwards;
+                /*let mut left_index = 0;
+                loop {
+                    let Some((point, anchor)) = offsets.get(index) else {
+                        break;
+                    };
+                    if point.row as u32 != cursor_point.row {
+                        break;
+                    }
+                    // Add marker
+                    if let Some(left_label) = label_settings.left_line_labels.get(left_index) {
+                        jump_markers.insert(JumpMarkerLocation {
+                            window_location: rope::Point {
+                                row: point.row as u32,
+                                column: point.column as u32,
+                            },
+                            anchor: *anchor,
+                            label: left_label.clone(),
+                        });
+                    }
+
+                    if index == 0 {
+                        break;
+                    }
+                    index -= 1;
+                    left_index += 1;
+                }*/
+                // Todo: Screen backwards (i.e. other lines)
+                let mut above_index = 0;
+                loop {
+                    let Some((point, anchor)) = offsets.get(index) else {
+                        break;
+                    };
+
+                    if let Some(above_label) = label_settings.screen_before.get(above_index) {
+                        jump_markers.insert(JumpMarkerLocation {
+                            window_location: rope::Point {
+                                row: point.row as u32,
+                                column: point.column as u32,
+                            },
+                            anchor: *anchor,
+                            label: above_label.clone(),
+                        });
+                    };
+                    if index == 0 {
+                        break;
+                    }
+                    index -= 1;
+                    above_index += 1;
+                }
+            }
+            // TODO: Forwards
+            // Line forwards
+            {
+                let mut index = num_backwards + 1;
+                /*let mut right_index = 0;
+                //let mut right_index = 0;
+                loop {
+                    let Some((point, anchor)) = offsets.get(index) else {
+                        break;
+                    };
+                    if point.row as u32 != cursor_point.row {
+                        break;
+                    }
+                    // Add marker
+                    if let Some(right_label) = label_settings.right_line_labels.get(right_index) {
+                        jump_markers.insert(JumpMarkerLocation {
+                            window_location: rope::Point {
+                                row: point.row as u32,
+                                column: point.column as u32,
+                            },
+                            anchor: *anchor,
+                            label: right_label.clone(),
+                        });
+                    }
+
+                    if index >= offsets.len() {
+                        break;
+                    }
+                    index += 1;
+                    right_index += 1;
+                }*/
+
+                // TODO: Screen forwards (i.e. other lines)
+                let mut below_index = 0;
+                loop {
+                    let Some((point, anchor)) = offsets.get(index) else {
+                        break;
+                    };
+                    if let Some(below_label) = label_settings.screen_after.get(below_index) {
+                        jump_markers.insert(JumpMarkerLocation {
+                            window_location: rope::Point {
+                                row: point.row as u32,
+                                column: point.column as u32,
+                            },
+                            anchor: *anchor,
+                            label: below_label.clone(),
+                        });
+                    };
+
+                    if index >= offsets.len() {
+                        break;
+                    }
+                    index += 1;
+                    below_index += 1;
+                }
+            }
+            num_backwards
+        } else {
+            // Multiple cursors on different rows, create multiple markers with
+            // the same names on the different lines, so the user can jump with
+            // all cursors at the same time
+            for cursor in cursors.iter() {
+                let cursor_point = self.offset_to_point(cursor.clone());
+                let _num_backwards = offsets.partition_point(|(o, _a)| {
+                    (o.row as u32 <= cursor_point.row) && ((o.column as u32) < cursor_point.column)
+                });
+            }
+            // TODO: Implement support for handling multiple cursors on
+            // different rows, preferably factoring out and reusing some code
+            // from the per line logic in the cases above
+            0
+        };
+        log::trace!(
+            "Found marker locations: O: {:?} M: {:?}",
+            offsets,
+            jump_markers
+        );
+        JumpMarkerMap::from_locations(jump_markers, num_backwards)
     }
 }
 

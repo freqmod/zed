@@ -177,6 +177,9 @@ pub(crate) fn zed_default_dark() -> Theme {
                 editor_active_wrap_guide: hsla(228. / 360., 8. / 100., 25. / 100., 1.),
                 editor_indent_guide: hsla(228. / 360., 8. / 100., 25. / 100., 1.),
                 editor_indent_guide_active: hsla(225. / 360., 13. / 100., 12. / 100., 1.),
+                editor_jump_marker_first: hsla(222.0 / 360., 6.5 / 100., 30.1 / 100., 1.0),
+                editor_jump_marker: hsla(222.0 / 360., 5.5 / 100., 20.1 / 100., 1.0),
+                editor_jump_marker_entered: hsla(222.0 / 360., 20.0 / 100., 30.1 / 100., 1.0),
                 editor_document_highlight_read_background: hsla(
                     207.8 / 360.,
                     81. / 100.,

@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 use settings_macros::{MergeFrom, with_fallible_options};
 
 use crate::{
-    DelayMs, DiagnosticSeverityContent, ShowScrollbar, serialize_f32_with_two_decimal_places,
+    DelayMs, DiagnosticSeverityContent, JumpLabelSettingsContent, ShowScrollbar,
+    serialize_f32_with_two_decimal_places,
 };
 
 #[with_fallible_options]
@@ -261,6 +262,8 @@ pub struct EditorSettingsContent {
     ///
     /// Default: 100
     pub minimum_split_diff_width: Option<f32>,
+    
+    pub jump_labels: Option<JumpLabelSettingsContent>,
 }
 
 #[derive(

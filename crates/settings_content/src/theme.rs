@@ -1075,6 +1075,15 @@ pub struct ThemeColorsContent {
     /// Foreground color for Vim Helix Select mode indicator.
     #[serde(rename = "vim.helix_select.foreground")]
     pub vim_helix_select_foreground: Option<String>,
+    // Jump marker characters used for jumping to words
+    #[serde(rename = "editor.jump_marker")]
+    pub editor_jump_marker: Option<String>,
+    // Jump marker characters used for jumping to words, first character
+    #[serde(rename = "editor.jump_marker.first")]
+    pub editor_jump_marker_first: Option<String>,
+    // Jump marker characters used for jumping to words, entered characters
+    #[serde(rename = "editor.jump_marker.entered")]
+    pub editor_jump_marker_entered: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]

@@ -16096,6 +16096,7 @@ dependencies = [
  "serde_json_lenient",
  "settings_json",
  "settings_macros",
+ "smallvec",
  "strum 0.27.2",
  "util",
 ]
@@ -19517,6 +19518,7 @@ dependencies = [
  "serde_json",
  "settings",
  "settings_ui",
+ "smallvec",
  "task",
  "text",
  "theme",

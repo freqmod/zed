@@ -502,6 +502,7 @@
       "g t": "vim::WindowTop",
       "g c": "vim::WindowMiddle",
       "g b": "vim::WindowBottom",
+      "g w": ["vim::PushHelixGoToLineLocation", { "entered_characters": []}], 
       "g r": "editor::FindAllReferences",
       "g n": "pane::ActivateNextItem",
       "shift-l": "pane::ActivateNextItem", // not a helix default

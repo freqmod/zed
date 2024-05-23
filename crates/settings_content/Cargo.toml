@@ -23,6 +23,7 @@ language_model_core.workspace = true
 log.workspace = true
 schemars.workspace = true
 serde.workspace = true
+smallvec.workspace = true
 serde_json.workspace = true
 serde_json_lenient.workspace = true
 settings_json.workspace = true

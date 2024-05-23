@@ -225,6 +225,12 @@ pub struct ThemeColors {
     pub editor_active_wrap_guide: Hsla,
     pub editor_indent_guide: Hsla,
     pub editor_indent_guide_active: Hsla,
+    // Text color used to mark jump markers for words etc.
+    pub editor_jump_marker: Hsla,
+    // Text color used to mark jump markers for words etc. This is for the first letter only
+    pub editor_jump_marker_first: Hsla,
+    // Text color used to mark jump markers for words etc. This is for the letters that have been entered
+    pub editor_jump_marker_entered: Hsla,
     /// Read-access of a symbol, like reading a variable.
     ///
     /// A document highlight is a range inside a text document which deserves

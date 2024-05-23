@@ -363,6 +363,11 @@ pub fn jump_motion(
     line: bool,
 ) -> (DisplayPoint, SelectionGoal) {
     let mut point = anchor.to_display_point(map);
+    log::error!(
+        "Mark jump motion: Anchor: {:?} DisplayPoint: {:?}",
+        anchor,
+        point
+    );
     if line {
         point = motion::first_non_whitespace(map, false, point)
     }
