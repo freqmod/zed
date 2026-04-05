@@ -31,7 +31,7 @@ use language::{
 #[cfg(any(test, feature = "test-support"))]
 use gpui::AppContext as _;
 
-use rope::DimensionPair;
+use rope::{DimensionPair, Lines};
 use settings::Settings;
 use smallvec::SmallVec;
 use std::{
@@ -7076,7 +7076,7 @@ fn extract_offsets_from_excerpt(
     excerpt: &Excerpt,
     region_range: Range<BufferOffset>,
     offsets: &mut Vec<(tree_sitter::Point, Anchor)>,
-) -> bool {
+) {
     let mut excerpts_cursor = snapshot.excerpts.cursor::<ExcerptSummary>(());
     excerpts_cursor.seek_forward(&excerpt.path_key, Bias::Left);
 
@@ -7092,12 +7092,20 @@ fn extract_offsets_from_excerpt(
             offsets,
         );
     }
+
     if !layers_found {
-        log::error!("No syntax layer when laying out marker map");
-        // if no syntax node, reset map, and possibly make a map based on
-        // word boundaries alone
+        // No syntax layers found, just create a jump marker map based on word
+        // boundaries per line
+        let buffer_snapshot = excerpt.buffer_snapshot(snapshot);
+        let buffer_text = buffer_snapshot.text_for_range(region_range.clone());
+        offsets_from_lines(
+            buffer_snapshot,
+            excerpt.path_key_index,
+            region_range.start,
+            buffer_text.lines(),
+            offsets,
+        );
     };
-    layers_found
 }
 
 fn excerpt_offsets_from_syntax_layer<'e, 'l>(
@@ -7135,17 +7143,13 @@ fn excerpt_offsets_from_syntax_layer<'e, 'l>(
                 // it (e.g. for word boundaries), where we transition from
                 // alphanumeric charcters to special characters or vice versa
                 let node_data = buffer_snapshot.text_for_range(buffer_node_range.clone());
-                let mut lines = node_data.lines();
-                let mut line_range_offset = 0;
-                while let Some(line) = lines.next() {
-                    offsets.extend(offsets_from_line(
-                        buffer_snapshot,
-                        excerpt.path_key_index,
-                        buffer_node_range.start + line_range_offset,
-                        line,
-                    ));
-                    line_range_offset += line.len();
-                }
+                offsets_from_lines(
+                    buffer_snapshot,
+                    excerpt.path_key_index,
+                    buffer_node_range.start,
+                    node_data.lines(),
+                    offsets,
+                );
             }
             offsets.push((
                 node_range.start_point,
@@ -7186,6 +7190,26 @@ fn excerpt_offsets_from_syntax_layer<'e, 'l>(
         }
     }
 }
+
+fn offsets_from_lines<'a>(
+    buffer_snapshot: &BufferSnapshot,
+    excerpt_id: PathKeyIndex,
+    start_offset: BufferOffset,
+    mut lines: Lines<'a>,
+    offsets: &mut Vec<(tree_sitter::Point, Anchor)>,
+) {
+    let mut line_range_offset = 0;
+    while let Some(line) = lines.next() {
+        offsets.extend(offsets_from_line(
+            buffer_snapshot,
+            excerpt_id,
+            start_offset + line_range_offset,
+            line,
+        ));
+        line_range_offset += line.len();
+    }
+}
+
 fn offsets_from_line(
     buffer_snapshot: &BufferSnapshot,
     excerpt_id: PathKeyIndex,
