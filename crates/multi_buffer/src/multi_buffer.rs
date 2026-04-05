@@ -3452,6 +3452,8 @@ impl MultiBuffer {
 impl EventEmitter<Event> for MultiBuffer {}
 
 impl MultiBufferSnapshot {
+    const MIN_JUMP_MARKER_OFFSET_DISTANCE: isize = 4;
+
     pub fn text(&self) -> String {
         self.chunks(
             MultiBufferOffset::ZERO..self.len(),
@@ -6861,7 +6863,6 @@ impl MultiBufferSnapshot {
         visible_range: Range<MultiBufferOffset>,
         label_settings: JumpLabelSettingsRef<'a>,
     ) -> JumpMarkerMap {
-        const MIN_JUMP_MARKER_OFFSET_DISTANCE: isize = 4;
         /*let first_excerpt_id = self.excerpts.first().map(|e| e.id);
         log::error!(
             "Create marker: C: {:?} R:{:?} Feid: {:?}",
@@ -6895,161 +6896,13 @@ impl MultiBufferSnapshot {
             + start_region.buffer_range.start.0;
         let visible_range_len = visible_range_offset.end.0 - visible_range_offset.start.0;
 
+        let mut offsets = Vec::new();
         let region_range = BufferOffset(buffer_start.0)
             ..BufferOffset(
                 (buffer_start.0 + visible_range_len).min(start_region.buffer_range.end.0),
             );
 
-        // TODO: Do  need to enumerate multi buffer excerpts instead?
-        // Multi buffers excerpts seems to be an external interface, maybe enumeate diffviews?
-        let mut excerpts_cursor = self.excerpts.cursor::<ExcerptSummary>(());
-        //let mut excerpts_cursor = self.excerpts.cursor::<Option<&Locator>>(());
-        excerpts_cursor.seek_forward(&start_excerpt.path_key, Bias::Left);
-        // TODO: We should probably handle all layers, and also cases where
-        // there is no syntax and we want to use starndard word boundary
-        // heuristics. but just use the first language for now to try to get
-        // someting running
-        let Some(syntax_layer) = start_excerpt.buffer_snapshot(self).syntax_layers().next() else {
-            log::error!("No syntax layer when laying out marker map");
-            // if no syntax node, reset map, and possibly make a map based on
-            // word boundaries alone
-            return JumpMarkerMap::default();
-        };
-        let cursor_node = syntax_layer.node();
-        /*log::warn!(
-            "Syntax layer count: {}",
-            start_excerpt.buffer.syntax_layers().count()
-        );*/
-
-        let mut tree_cursor = cursor_node.walk();
-        let mut offsets = Vec::new();
-
-        //let buffer_text = start_excerpt.buffer.text();
-        let buffer_snapshot = start_excerpt.buffer_snapshot(self);
-        // TODO: Try to avoid walking the whole file and rather walk the nodes that correspond to elements in view
-        // TODO: Anchor logic is off when soft wrap line breaks
-        'outer: loop {
-            let node = tree_cursor.node();
-
-            let node_range = node.range();
-            let buffer_node_range =
-                BufferOffset(node_range.start_byte)..BufferOffset(node_range.end_byte);
-
-            // This range is probably in buffer offsets
-
-            if region_range.contains(&BufferOffset(node_range.start_byte))
-                || region_range.contains(&BufferOffset(node_range.end_byte))
-            {
-                let node_range_length = node_range.end_byte.saturating_sub(node_range.start_byte);
-
-                if node.child_count() == 0
-                    && node_range_length > MIN_JUMP_MARKER_OFFSET_DISTANCE as usize
-                {
-                    // If node has a certain length, and no children go trough
-                    // the node as text and see if we should add markers inside
-                    // it (e.g. for word boundaries), where we transition from
-                    // alphanumeric charcters to special characters or vice versa
-                    let node_data = buffer_snapshot.text_for_range(buffer_node_range.clone());
-                    let mut lines = node_data.lines();
-                    let mut line_range_offset = 0;
-                    while let Some(line) = lines.next() {
-                        let first_alphanumeric = line
-                            .chars()
-                            .next()
-                            .map(|c| c.is_alphanumeric())
-                            .unwrap_or(false);
-                        offsets.extend(
-                            line.char_indices().enumerate()
-                                .scan(
-                                    (
-                                        first_alphanumeric, // was_alphanumeric
-                                        0usize,             // last_alphanumeric_offset
-                                    ),
-                                    |(was_alphanumeric, last_transition_offset),
-                                     (char_index, (byte_offset, c))| {
-                                        // How can we prioritize transitions from space to words
-                                        let is_alphanumeric = c.is_alphanumeric();
-                                        let last_was_alphanumeric = *was_alphanumeric;
-                                        *was_alphanumeric = is_alphanumeric;
-                                        if last_was_alphanumeric != is_alphanumeric {
-                                            if (last_was_alphanumeric && c.is_whitespace())
-                                                || ((char_index- *last_transition_offset)
-                                                    <= MIN_JUMP_MARKER_OFFSET_DISTANCE as usize)
-                                            {
-                                                Some(None)
-                                            } else {
-                                                *last_transition_offset = char_index;
-                                                Some(Some(byte_offset))
-                                            }
-                                        } else {
-                                            Some(None)
-                                        }
-                                    },
-                                )
-                                .filter_map(|line_offset| {
-                                    line_offset.map(|line_offset| {
-                                        let buffer_offset = buffer_node_range.start
-                                            + line_range_offset
-                                            + line_offset;
-                                        let start_point_buf =
-                                            buffer_snapshot.offset_to_point(buffer_offset.0);
-                                        let start_point = tree_sitter::Point {
-                                            row: start_point_buf.row as usize,
-                                            column: start_point_buf.column as usize,
-                                        };
-
-                                        (
-                                            start_point,
-                                            Anchor::in_buffer(
-                                                start_excerpt.path_key_index,
-                                                buffer_snapshot
-                                                    .anchor_at(buffer_offset, Bias::Left),
-                                            ),
-                                        )
-                                    })
-                                }),
-                        );
-                        line_range_offset += line.len();
-                    }
-                }
-                offsets.push((
-                    node_range.start_point,
-                    Anchor::in_buffer(
-                        start_excerpt.path_key_index,
-                        buffer_snapshot.anchor_at(node_range.start_byte, Bias::Left),
-                    ),
-                ));
-                offsets.push((
-                    node_range.end_point,
-                    Anchor::in_buffer(
-                        start_excerpt.path_key_index,
-                        buffer_snapshot.anchor_at(node_range.end_byte, Bias::Right),
-                    ),
-                ));
-                /*} else {
-                // If both start and end is outside the current screen break to
-                // avoid walking the whole file
-                break;*/
-            }
-
-            // Go down if possible
-            if tree_cursor.goto_first_child() {
-                continue;
-            }
-
-            // Otherwise try siblings, walking back up as needed
-            loop {
-                if tree_cursor.goto_next_sibling() {
-                    break;
-                }
-                if !tree_cursor.goto_parent() {
-                    // We're done, back at root and no more siblings
-                    break 'outer;
-                }
-                // Now on parent's node, get its next sibling
-                //tree_cursor.goto_next_sibling();
-            }
-        }
+        extract_offsets_from_excerpt(self, start_excerpt, region_range, &mut offsets);
 
         offsets.sort_unstable_by_key(|(point, _)| *point);
 
@@ -7086,7 +6939,7 @@ impl MultiBufferSnapshot {
                     Some(last)
                         if (last.0.row != o.0.row
                             || (last.0.column as isize - o.0.column as isize).abs()
-                                > MIN_JUMP_MARKER_OFFSET_DISTANCE) =>
+                                > MultiBufferSnapshot::MIN_JUMP_MARKER_OFFSET_DISTANCE) =>
                     {
                         *last_kept = Some(*o);
                         Some(Some(*o))
@@ -7267,6 +7120,173 @@ impl MultiBufferSnapshot {
         );
         JumpMarkerMap::from_locations(jump_markers, num_backwards)
     }
+}
+
+fn extract_offsets_from_excerpt<'a, 's>(
+    snapshot: &'s MultiBufferSnapshot,
+    excerpt: &'a Excerpt,
+    region_range: Range<BufferOffset>,
+    offsets: &mut Vec<(tree_sitter::Point, Anchor)>,
+) -> bool {
+    // TODO: Do  need to enumerate multi buffer excerpts instead?
+    // Multi buffers excerpts seems to be an external interface, maybe enumeate diffviews?
+    let mut excerpts_cursor = snapshot.excerpts.cursor::<ExcerptSummary>(());
+    //let mut excerpts_cursor = self.excerpts.cursor::<Option<&Locator>>(());
+    excerpts_cursor.seek_forward(&excerpt.path_key, Bias::Left);
+    // TODO: We should probably handle all layers, and also cases where
+    // there is no syntax and we want to use starndard word boundary
+    // heuristics. but just use the first language for now to try to get
+    // someting running
+    let Some(syntax_layer) = excerpt.buffer_snapshot(snapshot).syntax_layers().next() else {
+        log::error!("No syntax layer when laying out marker map");
+        // if no syntax node, reset map, and possibly make a map based on
+        // word boundaries alone
+        return false;
+    };
+    let cursor_node = syntax_layer.node();
+    /*log::warn!(
+        "Syntax layer count: {}",
+        start_excerpt.buffer.syntax_layers().count()
+    );*/
+
+    let mut tree_cursor = cursor_node.walk();
+
+    //let buffer_text = start_excerpt.buffer.text();
+    let buffer_snapshot = excerpt.buffer_snapshot(snapshot);
+    // TODO: Try to avoid walking the whole file and rather walk the nodes that correspond to elements in view
+    // TODO: Anchor logic is off when soft wrap line breaks
+    'outer: loop {
+        let node = tree_cursor.node();
+
+        let node_range = node.range();
+        let buffer_node_range =
+            BufferOffset(node_range.start_byte)..BufferOffset(node_range.end_byte);
+
+        // This range is probably in buffer offsets
+
+        if region_range.contains(&BufferOffset(node_range.start_byte))
+            || region_range.contains(&BufferOffset(node_range.end_byte))
+        {
+            let node_range_length = node_range.end_byte.saturating_sub(node_range.start_byte);
+
+            if node.child_count() == 0
+                && node_range_length > MultiBufferSnapshot::MIN_JUMP_MARKER_OFFSET_DISTANCE as usize
+            {
+                // If node has a certain length, and no children go trough
+                // the node as text and see if we should add markers inside
+                // it (e.g. for word boundaries), where we transition from
+                // alphanumeric charcters to special characters or vice versa
+                let node_data = buffer_snapshot.text_for_range(buffer_node_range.clone());
+                let mut lines = node_data.lines();
+                let mut line_range_offset = 0;
+                while let Some(line) = lines.next() {
+                    offsets.extend(offsets_from_line(
+                        buffer_snapshot,
+                        excerpt.path_key_index,
+                        buffer_node_range.start + line_range_offset,
+                        line,
+                    ));
+                    line_range_offset += line.len();
+                }
+            }
+            offsets.push((
+                node_range.start_point,
+                Anchor::in_buffer(
+                    excerpt.path_key_index,
+                    buffer_snapshot.anchor_at(node_range.start_byte, Bias::Left),
+                ),
+            ));
+            offsets.push((
+                node_range.end_point,
+                Anchor::in_buffer(
+                    excerpt.path_key_index,
+                    buffer_snapshot.anchor_at(node_range.end_byte, Bias::Right),
+                ),
+            ));
+            /*} else {
+            // If both start and end is outside the current screen break to
+            // avoid walking the whole file
+            break;*/
+        }
+
+        // Go down if possible
+        if tree_cursor.goto_first_child() {
+            continue;
+        }
+
+        // Otherwise try siblings, walking back up as needed
+        loop {
+            if tree_cursor.goto_next_sibling() {
+                break;
+            }
+            if !tree_cursor.goto_parent() {
+                // We're done, back at root and no more siblings
+                break 'outer;
+            }
+            // Now on parent's node, get its next sibling
+            //tree_cursor.goto_next_sibling();
+        }
+    }
+    true
+}
+
+fn offsets_from_line(
+    buffer_snapshot: &BufferSnapshot,
+    excerpt_id: PathKeyIndex,
+    start_offset: BufferOffset,
+    line: &str,
+) -> impl Iterator<Item = (tree_sitter::Point, Anchor)> {
+    let first_alphanumeric = line
+        .chars()
+        .next()
+        .map(|c| c.is_alphanumeric())
+        .unwrap_or(false);
+
+    line.char_indices()
+        .enumerate()
+        .scan(
+            (
+                first_alphanumeric, // was_alphanumeric
+                0usize,             // last_alphanumeric_offset
+            ),
+            |(was_alphanumeric, last_transition_offset), (char_index, (byte_offset, c))| {
+                // How can we prioritize transitions from space to words
+                let is_alphanumeric = c.is_alphanumeric();
+                let last_was_alphanumeric = *was_alphanumeric;
+                *was_alphanumeric = is_alphanumeric;
+                if last_was_alphanumeric != is_alphanumeric {
+                    if (last_was_alphanumeric && c.is_whitespace())
+                        || ((char_index - *last_transition_offset)
+                            <= MultiBufferSnapshot::MIN_JUMP_MARKER_OFFSET_DISTANCE as usize)
+                    {
+                        Some(None)
+                    } else {
+                        *last_transition_offset = char_index;
+                        Some(Some(byte_offset))
+                    }
+                } else {
+                    Some(None)
+                }
+            },
+        )
+        .filter_map(move |line_offset| {
+            line_offset.map(|line_offset| {
+                let buffer_offset = start_offset + line_offset;
+                let start_point_buf = buffer_snapshot.offset_to_point(buffer_offset.0);
+                let start_point = tree_sitter::Point {
+                    row: start_point_buf.row as usize,
+                    column: start_point_buf.column as usize,
+                };
+
+                (
+                    start_point,
+                    Anchor::in_buffer(
+                        excerpt_id,
+                        buffer_snapshot.anchor_at(buffer_offset, Bias::Left),
+                    ),
+                )
+            })
+        })
 }
 
 #[cfg(any(test, feature = "test-support"))]
