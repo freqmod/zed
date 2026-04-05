@@ -23,7 +23,7 @@ use language::{
     AutoindentMode, Buffer, BufferChunks, BufferRow, BufferSnapshot, Capability, CharClassifier,
     CharKind, CharScopeContext, Chunk, CursorShape, DiagnosticEntryRef, File, IndentGuideSettings,
     IndentSize, Language, LanguageAwareStyling, LanguageScope, OffsetRangeExt, OffsetUtf16,
-    Outline, OutlineItem, Point, PointUtf16, Selection, TextDimension, TextObject, ToOffset as _,
+    Outline, OutlineItem, Point, PointUtf16, Selection, SyntaxLayer, TextDimension, TextObject, ToOffset as _,
     ToPoint as _, TransactionId, TreeSitterOptions, Unclipped,
     language_settings::{AllLanguageSettings, LanguageSettings},
 };
@@ -6863,13 +6863,6 @@ impl MultiBufferSnapshot {
         visible_range: Range<MultiBufferOffset>,
         label_settings: JumpLabelSettingsRef<'a>,
     ) -> JumpMarkerMap {
-        /*let first_excerpt_id = self.excerpts.first().map(|e| e.id);
-        log::error!(
-            "Create marker: C: {:?} R:{:?} Feid: {:?}",
-            cursors,
-            visible_range,
-            first_excerpt_id
-        );*/
         // Range of visible area where jump markers should be made
         // Get node for visible area, walk it and note down all the start / end points in an ordered map
         // then create marker points related to the currunt cursor.
@@ -6915,109 +6908,31 @@ impl MultiBufferSnapshot {
                 .map(|c| self.offset_to_point(c.clone()).row)
                 .all_unique()
         {
-            let cursor = &cursors[0];
-            let cursor_point = self.offset_to_point(cursor.clone());
-            let compare_offsets = |(o, _): &(tree_sitter::Point, Anchor)| match (o.row as u32)
-                .cmp(&cursor_point.row)
-            {
-                cmp::Ordering::Equal => (o.column as u32) < cursor_point.column,
-                cmp::Ordering::Less => true,
-                cmp::Ordering::Greater => false,
-            };
-
-            let num_backwards = offsets.partition_point(compare_offsets);
-
-            let mut new_offsets: Vec<(tree_sitter::Point, Anchor)> =
-                Vec::with_capacity(offsets.len());
-            let offset_filter = |last_kept: &'_ mut Option<(tree_sitter::Point, Anchor)>,
-                                 o: &(tree_sitter::Point, Anchor)| {
-                match last_kept {
-                    None => {
-                        *last_kept = Some(*o);
-                        Some(Some(*o))
-                    }
-                    Some(last)
-                        if (last.0.row != o.0.row
-                            || (last.0.column as isize - o.0.column as isize).abs()
-                                > MultiBufferSnapshot::MIN_JUMP_MARKER_OFFSET_DISTANCE) =>
-                    {
-                        *last_kept = Some(*o);
-                        Some(Some(*o))
-                    }
-                    _ => Some(None),
-                }
-            };
-
-            new_offsets.extend(
-                offsets[0..num_backwards]
-                    .iter()
-                    .rev()
-                    .scan(None, offset_filter)
-                    .filter_map(|o| o),
-            );
-            new_offsets.reverse();
-            if let Some(forward_filtered) =
-                offsets
-                    .get((num_backwards + 1)..offsets.len())
-                    .map(|forward_offsets| {
-                        forward_offsets
-                            .iter()
-                            .scan(None, offset_filter)
-                            .filter_map(|o| o)
-                    })
-            {
-                new_offsets.extend(forward_filtered);
-            }
-
+            let (new_offsets, num_backwards) =
+                offsets_sort_and_deduplicate(self, &cursors[0], offsets.as_slice());
             let old_offsets = offsets;
             offsets = new_offsets;
+            {
+                let cursor_point = self.offset_to_point(cursors[0].clone());
+                log::warn!(
+                    "Split markers: At: {:?} {:?} - {:?} BW: {} Old total: {} Total: {} (First: {:?} Last: {:?})",
+                    cursor_point,
+                    offsets.get(num_backwards),
+                    offsets.get(num_backwards + 1),
+                    num_backwards,
+                    old_offsets.len(),
+                    offsets.len(),
+                    offsets.get(0),
+                    offsets.last(),
+                );
+            }
 
-            // Recalculate partition point with new offsets
-            let num_backwards = offsets.partition_point(compare_offsets);
-            // Partition point ends up one before the actual cursor (determined
-            // experimentally), compensate for this
-            let num_backwards = num_backwards.saturating_sub(1);
-            log::warn!(
-                "Split markers: At: {:?} {:?} - {:?} BW: {} Old total: {} Total: {} (First: {:?} Last: {:?})",
-                cursor_point,
-                offsets.get(num_backwards),
-                offsets.get(num_backwards + 1),
-                num_backwards,
-                old_offsets.len(),
-                offsets.len(),
-                offsets.get(0),
-                offsets.last(),
-            );
-            // Line backwards
+            // Convert offsets to jump markers based on the jump marker strings
+            // in settings
+
+            // Backwards from cursor
             {
                 let mut index = num_backwards;
-                /*let mut left_index = 0;
-                loop {
-                    let Some((point, anchor)) = offsets.get(index) else {
-                        break;
-                    };
-                    if point.row as u32 != cursor_point.row {
-                        break;
-                    }
-                    // Add marker
-                    if let Some(left_label) = label_settings.left_line_labels.get(left_index) {
-                        jump_markers.insert(JumpMarkerLocation {
-                            window_location: rope::Point {
-                                row: point.row as u32,
-                                column: point.column as u32,
-                            },
-                            anchor: *anchor,
-                            label: left_label.clone(),
-                        });
-                    }
-
-                    if index == 0 {
-                        break;
-                    }
-                    index -= 1;
-                    left_index += 1;
-                }*/
-                // Todo: Screen backwards (i.e. other lines)
                 let mut above_index = 0;
                 loop {
                     let Some((point, anchor)) = offsets.get(index) else {
@@ -7041,39 +6956,10 @@ impl MultiBufferSnapshot {
                     above_index += 1;
                 }
             }
-            // TODO: Forwards
-            // Line forwards
+
+            // Forwards from cursor
             {
                 let mut index = num_backwards + 1;
-                /*let mut right_index = 0;
-                //let mut right_index = 0;
-                loop {
-                    let Some((point, anchor)) = offsets.get(index) else {
-                        break;
-                    };
-                    if point.row as u32 != cursor_point.row {
-                        break;
-                    }
-                    // Add marker
-                    if let Some(right_label) = label_settings.right_line_labels.get(right_index) {
-                        jump_markers.insert(JumpMarkerLocation {
-                            window_location: rope::Point {
-                                row: point.row as u32,
-                                column: point.column as u32,
-                            },
-                            anchor: *anchor,
-                            label: right_label.clone(),
-                        });
-                    }
-
-                    if index >= offsets.len() {
-                        break;
-                    }
-                    index += 1;
-                    right_index += 1;
-                }*/
-
-                // TODO: Screen forwards (i.e. other lines)
                 let mut below_index = 0;
                 loop {
                     let Some((point, anchor)) = offsets.get(index) else {
@@ -7122,37 +7008,109 @@ impl MultiBufferSnapshot {
     }
 }
 
-fn extract_offsets_from_excerpt<'a, 's>(
-    snapshot: &'s MultiBufferSnapshot,
-    excerpt: &'a Excerpt,
+fn offsets_sort_and_deduplicate(
+    buffer_snapshot: &MultiBufferSnapshot,
+    cursor: &MultiBufferOffset,
+    offsets: &[(tree_sitter::Point, Anchor)],
+) -> (Vec<(tree_sitter::Point, Anchor)>, usize) {
+    let cursor_point = buffer_snapshot.offset_to_point(cursor.clone());
+    let compare_offsets =
+        |(o, _): &(tree_sitter::Point, Anchor)| match (o.row as u32).cmp(&cursor_point.row) {
+            cmp::Ordering::Equal => (o.column as u32) < cursor_point.column,
+            cmp::Ordering::Less => true,
+            cmp::Ordering::Greater => false,
+        };
+
+    let num_backwards = offsets.partition_point(compare_offsets);
+
+    let mut new_offsets: Vec<(tree_sitter::Point, Anchor)> = Vec::with_capacity(offsets.len());
+    let offset_filter = |last_kept: &'_ mut Option<(tree_sitter::Point, Anchor)>,
+                         o: &(tree_sitter::Point, Anchor)| {
+        match last_kept {
+            None => {
+                *last_kept = Some(*o);
+                Some(Some(*o))
+            }
+            Some(last)
+                if (last.0.row != o.0.row
+                    || (last.0.column as isize - o.0.column as isize).abs()
+                        > MultiBufferSnapshot::MIN_JUMP_MARKER_OFFSET_DISTANCE) =>
+            {
+                *last_kept = Some(*o);
+                Some(Some(*o))
+            }
+            _ => Some(None),
+        }
+    };
+
+    new_offsets.extend(
+        offsets[0..num_backwards]
+            .iter()
+            .rev()
+            .scan(None, offset_filter)
+            .filter_map(|o| o),
+    );
+    new_offsets.reverse();
+    if let Some(forward_filtered) =
+        offsets
+            .get((num_backwards + 1)..offsets.len())
+            .map(|forward_offsets| {
+                forward_offsets
+                    .iter()
+                    .scan(None, offset_filter)
+                    .filter_map(|o| o)
+            })
+    {
+        new_offsets.extend(forward_filtered);
+    }
+    // Recalculate partition point with new offsets
+    let num_backwards = new_offsets.partition_point(compare_offsets);
+    // Partition point ends up one before the actual cursor (determined
+    // experimentally), compensate for this
+    let num_backwards = num_backwards.saturating_sub(1);
+    (new_offsets, num_backwards)
+}
+
+fn extract_offsets_from_excerpt(
+    snapshot: &MultiBufferSnapshot,
+    excerpt: &Excerpt,
     region_range: Range<BufferOffset>,
     offsets: &mut Vec<(tree_sitter::Point, Anchor)>,
 ) -> bool {
-    // TODO: Do  need to enumerate multi buffer excerpts instead?
-    // Multi buffers excerpts seems to be an external interface, maybe enumeate diffviews?
     let mut excerpts_cursor = snapshot.excerpts.cursor::<ExcerptSummary>(());
-    //let mut excerpts_cursor = self.excerpts.cursor::<Option<&Locator>>(());
     excerpts_cursor.seek_forward(&excerpt.path_key, Bias::Left);
-    // TODO: We should probably handle all layers, and also cases where
-    // there is no syntax and we want to use starndard word boundary
-    // heuristics. but just use the first language for now to try to get
-    // someting running
-    let Some(syntax_layer) = excerpt.buffer_snapshot(snapshot).syntax_layers().next() else {
+
+    let mut layers_found = false;
+    for syntax_layer in excerpt.buffer_snapshot(snapshot).syntax_layers() {
+        layers_found = true;
+        let buffer_snapshot = excerpt.buffer_snapshot(snapshot);
+        excerpt_offsets_from_syntax_layer(
+            buffer_snapshot,
+            excerpt,
+            &syntax_layer,
+            region_range.clone(),
+            offsets,
+        );
+    }
+    if !layers_found {
         log::error!("No syntax layer when laying out marker map");
         // if no syntax node, reset map, and possibly make a map based on
         // word boundaries alone
-        return false;
     };
-    let cursor_node = syntax_layer.node();
-    /*log::warn!(
-        "Syntax layer count: {}",
-        start_excerpt.buffer.syntax_layers().count()
-    );*/
+    layers_found
+}
 
+fn excerpt_offsets_from_syntax_layer<'e, 'l>(
+    buffer_snapshot: &BufferSnapshot,
+    excerpt: &'e Excerpt,
+    syntax_layer: &SyntaxLayer<'l>,
+    region_range: Range<BufferOffset>,
+    offsets: &mut Vec<(tree_sitter::Point, Anchor)>,
+) {
+    let cursor_node = syntax_layer.node();
     let mut tree_cursor = cursor_node.walk();
 
     //let buffer_text = start_excerpt.buffer.text();
-    let buffer_snapshot = excerpt.buffer_snapshot(snapshot);
     // TODO: Try to avoid walking the whole file and rather walk the nodes that correspond to elements in view
     // TODO: Anchor logic is off when soft wrap line breaks
     'outer: loop {
@@ -7227,9 +7185,7 @@ fn extract_offsets_from_excerpt<'a, 's>(
             //tree_cursor.goto_next_sibling();
         }
     }
-    true
 }
-
 fn offsets_from_line(
     buffer_snapshot: &BufferSnapshot,
     excerpt_id: PathKeyIndex,
