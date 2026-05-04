@@ -6856,7 +6856,7 @@ impl MultiBufferSnapshot {
         let end = Anchor::in_buffer(path_key, text::Anchor::max_for_buffer(buffer_id));
         Some((start..end).to_point(self))
     }
-    
+
     pub fn create_jump_marker_map<'a>(
         &self,
         cursors: &[MultiBufferOffset],
@@ -7165,12 +7165,11 @@ fn excerpt_offsets_from_syntax_layer<'e, 'l>(
                     buffer_snapshot.anchor_at(node_range.end_byte, Bias::Right),
                 ),
             ));
-            /*} else {
+        } else {
             // If both start and end is outside the current screen break to
             // avoid walking the whole file
-            break;*/
+            break;
         }
-
         // Go down if possible
         if tree_cursor.goto_first_child() {
             continue;
